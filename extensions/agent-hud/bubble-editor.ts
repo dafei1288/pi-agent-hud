@@ -193,6 +193,11 @@ export function installBubbleEditor(
 				const r7 = w7.resetAt ? formatResetCountdown(w7.resetAt) : "";
 				leftParts.push(`7d:${Math.round(w7.usedPercent)}%${r7 ? ` ↻${r7}` : ""}`);
 			}
+			if (planUsage?.monthly) {
+				const w30 = planUsage.monthly;
+				const r30 = w30.resetAt ? formatResetCountdown(w30.resetAt) : "";
+				leftParts.push(`30d:${Math.round(w30.usedPercent)}%${r30 ? ` ↻${r30}` : ""}`);
+			}
 			if (balanceInfo) leftParts.push(iconText(ICONS.money, balanceInfo.label));
 			const leftText = leftParts.join(sep);
 

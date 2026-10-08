@@ -47,6 +47,8 @@ export interface PlanUsageInfo {
 	source: string;
 	fiveHour?: PlanWindowUsage;
 	weekly?: PlanWindowUsage;
+	/** 月度窗口（如 opencode Zen 30d），仅部分订阅有 */
+	monthly?: PlanWindowUsage;
 	capturedAt: number;
 }
 
@@ -75,9 +77,11 @@ export interface PlanProviderSpec {
 	 */
 	modelsJsonProvider?: string;
 	url: string;
+	/** 备用站点（CN/国际双站）：主站 401/403 或 AuthRejectedError 时依次尝试 */
+	fallbackUrls?: string[];
 	headers: (key: string) => Record<string, string>;
-	/** 归一化响应 JSON → 5h/weekly 窗口；undefined = 无可用数据 */
-	parse: (json: any) => { fiveHour?: PlanWindowUsage; weekly?: PlanWindowUsage } | undefined;
+	/** 归一化响应 JSON → 窗口；undefined = 无可用数据。抛 AuthRejectedError 表示 key 不属于该站点 */
+	parse: (json: any, url: string) => { fiveHour?: PlanWindowUsage; weekly?: PlanWindowUsage; monthly?: PlanWindowUsage } | undefined;
 }
 
 /** 余额 provider 的声明式描述 */
@@ -87,9 +91,15 @@ export interface BalanceProviderSpec {
 	authNames: string[];
 	modelsJsonProvider?: string;
 	url: string;
+	/** 备用站点（CN/国际双站）：主站 401/403 或 AuthRejectedError 时依次尝试 */
+	fallbackUrls?: string[];
 	headers: (key: string) => Record<string, string>;
-	parse: (json: any) => BalanceInfo | undefined;
+	/** 归一化响应 JSON → BalanceInfo；undefined = 无可用数据。抛 AuthRejectedError 表示 key 不属于该站点 */
+	parse: (json: any, url: string) => BalanceInfo | undefined;
 }
+
+/** parse 抛出该错误 = 该站点的 key 无效，尝试下一个站点（HTTP 200 + 业务层拒绝的接口用） */
+export class AuthRejectedError extends Error {}
 
 // ============================================================================
 // 响应头解析辅助
@@ -142,8 +152,12 @@ function resolveKey(spec: { envKeys: string[]; authNames: string[]; modelsJsonPr
 	if (spec.modelsJsonProvider) {
 		try {
 			const models = JSON.parse(readFileSync(join(homedir(), ".pi", "agent", "models.json"), "utf8"));
-			const key = models?.providers?.[spec.modelsJsonProvider]?.apiKey;
-			if (typeof key === "string" && key) return key;
+			let key = models?.providers?.[spec.modelsJsonProvider]?.apiKey;
+			// models.json 里 "apiKey": "$STEPFUN_API_KEY" 这类环境变量引用需要展开
+			if (typeof key === "string" && key.startsWith("$") && process.env[key.slice(1)]) {
+				key = process.env[key.slice(1)];
+			}
+			if (typeof key === "string" && key && !key.startsWith("$")) return key;
 		} catch { /* ignore */ }
 	}
 	return undefined;
@@ -152,6 +166,30 @@ function resolveKey(spec: { envKeys: string[]; authNames: string[]; modelsJsonPr
 // ============================================================================
 // 编码计划配额 provider 注册表
 // ============================================================================
+
+/** GLM Coding Plan 配额响应解析：window 条目 unit 3 = 小时窗口、unit 6 = 天窗口。key 失效时返回 HTTP 200 + success:false，抛 AuthRejectedError。 */
+function parseZaiQuota(json: any): { fiveHour?: PlanWindowUsage; weekly?: PlanWindowUsage } | undefined {
+	if (json?.success === false) throw new AuthRejectedError("zai: success:false");
+	const limits = json?.data?.limits;
+	if (!Array.isArray(limits)) return undefined;
+	let fiveHour: PlanWindowUsage | undefined;
+	let weekly: PlanWindowUsage | undefined;
+	for (const l of limits) {
+		// 接口已把 type 从 TOKENS_LIMIT 改为 CREDIT_LIMIT（2026-10 观察），两者都接受
+		if (l?.type !== "TOKENS_LIMIT" && l?.type !== "CREDIT_LIMIT") continue;
+		const w: PlanWindowUsage = {
+			usedPercent: typeof l.percentage === "number" ? Math.max(0, Math.min(100, l.percentage)) : 0,
+			resetAt: typeof l.nextResetTime === "number" ? l.nextResetTime : undefined,
+		};
+		if (l.unit === 3) {
+			fiveHour = { ...w, windowMinutes: (l.number || 5) * 60 };
+		} else if (l.unit === 6) {
+			// unit 6 的 number 是天数（如 7 = 每周），直接换算分钟，不再多乘一个 7
+			weekly = { ...w, windowMinutes: (l.number || 7) * 24 * 60 };
+		}
+	}
+	return fiveHour || weekly ? { fiveHour, weekly } : undefined;
+}
 
 export const PLAN_PROVIDERS: PlanProviderSpec[] = [
 	{
@@ -162,25 +200,7 @@ export const PLAN_PROVIDERS: PlanProviderSpec[] = [
 		authNames: ["zai-coding-cn"],
 		url: "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
 		headers: (key) => ({ Authorization: `Bearer ${key}` }),
-		parse: (json) => {
-			const limits = json?.data?.limits;
-			if (!Array.isArray(limits)) return undefined;
-			let fiveHour: PlanWindowUsage | undefined;
-			let weekly: PlanWindowUsage | undefined;
-			for (const l of limits) {
-				if (l?.type !== "TOKENS_LIMIT") continue;
-				const w: PlanWindowUsage = {
-					usedPercent: typeof l.percentage === "number" ? l.percentage : 0,
-					resetAt: typeof l.nextResetTime === "number" ? l.nextResetTime : undefined,
-				};
-				if (l.unit === 3) {
-					fiveHour = { ...w, windowMinutes: (l.number || 5) * 60 };
-				} else if (l.unit === 6) {
-					weekly = { ...w, windowMinutes: (l.number || 1) * 7 * 24 * 60 };
-				}
-			}
-			return fiveHour || weekly ? { fiveHour, weekly } : undefined;
-		},
+		parse: parseZaiQuota,
 	},
 	{
 		// MiniMax Coding Plan: GET /v1/api/openplatform/coding_plan/remains
@@ -261,6 +281,41 @@ export const PLAN_PROVIDERS: PlanProviderSpec[] = [
 			return fiveHour || weekly ? { fiveHour, weekly } : undefined;
 		},
 	},
+	{
+		// opencode Zen 订阅: GET /zen/go/v1/usage
+		// usage.rolling = 5h 窗口，weekly = 7d，monthly = 30d；百分比钳制 0-100。
+		providers: ["opencode-go", "opencode"],
+		envKeys: ["OPENCODE_API_KEY"],
+		authNames: ["opencode-go", "opencode"],
+		url: "https://opencode.ai/zen/go/v1/usage",
+		headers: (key) => ({ Authorization: `Bearer ${key}` }),
+		parse: (json) => {
+			const usage = json?.usage;
+			if (!usage) return undefined;
+			const clamp = (v: any): number | undefined =>
+				typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.min(100, v)) : undefined;
+			const win = (w: any, minutes?: number): PlanWindowUsage | undefined => {
+				const usedPercent = clamp(w?.percent);
+				if (usedPercent === undefined) return undefined;
+				const resetAt = typeof w?.resetsAt === "string" ? (Date.parse(w.resetsAt) || undefined) : undefined;
+				return { usedPercent, windowMinutes: minutes, resetAt };
+			};
+			const fiveHour = win(usage.rolling, 5 * 60);
+			const weekly = win(usage.weekly, 7 * 24 * 60);
+			const monthly = win(usage.monthly, 30 * 24 * 60);
+			return fiveHour || weekly || monthly ? { fiveHour, weekly, monthly } : undefined;
+		},
+	},
+	{
+		// GLM Coding Plan 国际版（Z.ai）: 与国内版同构，站点为 api.z.ai。
+		// 该接口的 Authorization 直接携带 key，不带 Bearer 前缀。
+		providers: ["zai-coding-plan", "zai"],
+		envKeys: ["ZAI_API_KEY", "ZHIPU_API_KEY"],
+		authNames: ["zai-coding-plan", "zai"],
+		url: "https://api.z.ai/api/monitor/usage/quota/limit",
+		headers: (key) => ({ Authorization: key }),
+		parse: parseZaiQuota,
+	},
 ];
 
 // ============================================================================
@@ -292,6 +347,134 @@ export const BALANCE_PROVIDERS: BalanceProviderSpec[] = [
 			};
 		},
 	},
+	{
+		// StepFun 开放平台: GET /v1/accounts（人民币计费，响应不含 currency 字段）
+		providers: ["stepfun", "stepfun-ai"],
+		envKeys: ["STEPFUN_API_KEY"],
+		authNames: ["stepfun"],
+		modelsJsonProvider: "stepfun",
+		url: "https://api.stepfun.com/v1/accounts",
+		headers: (key) => ({ Authorization: `Bearer ${key}` }),
+		parse: (json) => {
+			const balance = typeof json?.balance === "number" ? json.balance : undefined;
+			if (balance === undefined) return undefined;
+			return { provider: "stepfun", label: `¥${balance.toFixed(2)}`, value: balance, currency: "CNY", capturedAt: Date.now() };
+		},
+	},
+	{
+		// Kimi 开放平台国内站: GET /v1/users/me/balance（人民币）。
+		// code !== 0 = key 不属于该站点 → AuthRejectedError → 尝试国际站。
+		providers: ["moonshotai-cn", "moonshot"],
+		envKeys: ["MOONSHOT_API_KEY"],
+		authNames: ["moonshotai-cn", "moonshot"],
+		url: "https://api.moonshot.cn/v1/users/me/balance",
+		fallbackUrls: ["https://api.moonshot.ai/v1/users/me/balance"],
+		headers: (key) => ({ Authorization: `Bearer ${key}` }),
+		parse: (json, url) => {
+			if (json?.code !== undefined && json.code !== 0) throw new AuthRejectedError(`moonshot: code ${json.code}`);
+			const n = (v: any): number | undefined => { const x = Number(v); return Number.isFinite(x) ? x : undefined; };
+			const available = n(json?.data?.available_balance);
+			if (available === undefined) return undefined;
+			const currency = url.includes("moonshot.ai") ? "USD" : "CNY";
+			const symbol = currency === "USD" ? "$" : "¥";
+			return { provider: "moonshot", label: `${symbol}${available.toFixed(2)}`, value: available, currency, capturedAt: Date.now() };
+		},
+	},
+	{
+		// Kimi 开放平台国际站（api.moonshot.ai，美元）
+		providers: ["moonshotai"],
+		envKeys: ["MOONSHOT_API_KEY"],
+		authNames: ["moonshotai"],
+		url: "https://api.moonshot.ai/v1/users/me/balance",
+		headers: (key) => ({ Authorization: `Bearer ${key}` }),
+		parse: (json, url) => {
+			if (json?.code !== undefined && json.code !== 0) throw new AuthRejectedError(`moonshot: code ${json.code}`);
+			const n = (v: any): number | undefined => { const x = Number(v); return Number.isFinite(x) ? x : undefined; };
+			const available = n(json?.data?.available_balance);
+			if (available === undefined) return undefined;
+			return { provider: "moonshot", label: `$${available.toFixed(2)}`, value: available, currency: "USD", capturedAt: Date.now() };
+		},
+	},
+	{
+		// SiliconFlow 国内站: GET /v1/user/info（人民币）。
+		// status:false = key 不属于该站点 → AuthRejectedError → 尝试国际站。
+		providers: ["siliconflow-cn"],
+		envKeys: ["SILICONFLOW_CN_API_KEY", "SILICONFLOW_API_KEY"],
+		authNames: ["siliconflow-cn", "siliconflow"],
+		url: "https://api.siliconflow.cn/v1/user/info",
+		headers: (key) => ({ Authorization: `Bearer ${key}` }),
+		parse: (json) => {
+			if (json?.status === false) throw new AuthRejectedError("siliconflow: status:false");
+			const n = (v: any): number | undefined => { const x = Number(v); return Number.isFinite(x) ? x : undefined; };
+			const balance = n(json?.data?.balance);
+			if (balance === undefined) return undefined;
+			return { provider: "siliconflow", label: `¥${balance.toFixed(2)}`, value: balance, currency: "CNY", capturedAt: Date.now() };
+		},
+	},
+	{
+		// SiliconFlow 国际站（api.siliconflow.com，美元），失败时回退国内站
+		providers: ["siliconflow"],
+		envKeys: ["SILICONFLOW_API_KEY"],
+		authNames: ["siliconflow"],
+		url: "https://api.siliconflow.com/v1/user/info",
+		fallbackUrls: ["https://api.siliconflow.cn/v1/user/info"],
+		headers: (key) => ({ Authorization: `Bearer ${key}` }),
+		parse: (json, url) => {
+			if (json?.status === false) throw new AuthRejectedError("siliconflow: status:false");
+			const n = (v: any): number | undefined => { const x = Number(v); return Number.isFinite(x) ? x : undefined; };
+			const balance = n(json?.data?.balance);
+			if (balance === undefined) return undefined;
+			const currency = url.includes("siliconflow.cn") ? "CNY" : "USD";
+			const symbol = currency === "USD" ? "$" : "¥";
+			return { provider: "siliconflow", label: `${symbol}${balance.toFixed(2)}`, value: balance, currency, capturedAt: Date.now() };
+		},
+	},
+	{
+		// OpenRouter: GET /api/v1/credits（预付费 Credits 剩余，需 Management Key）。
+		// 普通 Key 会得到 403，此时不显示（避免误导），不算站点回退。
+		providers: ["openrouter"],
+		envKeys: ["OPENROUTER_API_KEY"],
+		authNames: ["openrouter"],
+		url: "https://openrouter.ai/api/v1/credits",
+		headers: (key) => ({ Authorization: `Bearer ${key}` }),
+		parse: (json) => {
+			const n = (v: any): number | undefined => { const x = Number(v); return Number.isFinite(x) ? x : undefined; };
+			const total = n(json?.data?.total_credits);
+			const used = n(json?.data?.total_usage);
+			if (total === undefined || used === undefined) return undefined;
+			const remaining = total - used;
+			return { provider: "openrouter", label: `$${remaining.toFixed(2)}`, value: remaining, currency: "USD", capturedAt: Date.now() };
+		},
+	},
+	{
+		// Skywork: GET /api/v1/balance（币种由响应携带）
+		providers: ["skywork", "skyworkmodel"],
+		envKeys: ["SKYWORK_API_KEY"],
+		authNames: ["skywork"],
+		url: "https://api.skyworkmodel.ai/api/v1/balance",
+		headers: (key) => ({ Authorization: `Bearer ${key}` }),
+		parse: (json) => {
+			const available = typeof json?.resp_data?.available_amount === "number" ? json.resp_data.available_amount : undefined;
+			if (available === undefined) return undefined;
+			const currency = json.resp_data?.currency ?? "USD";
+			const symbol = currency === "CNY" ? "¥" : currency === "USD" ? "$" : `${currency} `;
+			return { provider: "skywork", label: `${symbol}${available.toFixed(2)}`, value: available, currency, capturedAt: Date.now() };
+		},
+	},
+	{
+		// Novita: GET /openapi/v1/billing/balance/detail（金额单位 1/10000 USD）
+		providers: ["novita", "novita-ai"],
+		envKeys: ["NOVITA_API_KEY"],
+		authNames: ["novita"],
+		url: "https://api.novita.ai/openapi/v1/billing/balance/detail",
+		headers: (key) => ({ Authorization: `Bearer ${key}` }),
+		parse: (json) => {
+			const units = Number(json?.availableBalance);
+			if (!Number.isFinite(units)) return undefined;
+			const usd = units / 10_000;
+			return { provider: "novita", label: `$${usd.toFixed(2)}`, value: usd, currency: "USD", capturedAt: Date.now() };
+		},
+	},
 ];
 
 /** 查找处理某个 pi provider id 的配额 spec */
@@ -304,34 +487,58 @@ export function findBalanceProvider(provider: string | undefined): BalanceProvid
 	return provider ? BALANCE_PROVIDERS.find((p) => p.providers.includes(provider)) : undefined;
 }
 
+/** spec 的最后一个候选 URL（主站 + 备用站点的末尾） */
+function lastUrl(spec: { url: string; fallbackUrls?: string[] }): string {
+	const urls = [spec.url, ...(spec.fallbackUrls ?? [])];
+	return urls[urls.length - 1];
+}
+
 async function pollPlanProvider(spec: PlanProviderSpec): Promise<PlanUsageInfo | undefined> {
 	const key = resolveKey(spec);
 	if (!key) return undefined;
-	try {
-		const res = await fetch(spec.url, {
-			headers: spec.headers(key),
-			signal: AbortSignal.timeout(10_000),
-		});
-		if (!res.ok) return undefined;
-		const windows = spec.parse(await res.json());
-		if (windows) {
-			return { source: spec.providers[0], ...windows, capturedAt: Date.now() };
+	// 主站 → 备用站点依次尝试：HTTP 401/403 或业务层拒绝（AuthRejectedError）时换下一站
+	for (const url of [spec.url, ...(spec.fallbackUrls ?? [])]) {
+		try {
+			const res = await fetch(url, {
+				headers: spec.headers(key),
+				signal: AbortSignal.timeout(10_000),
+			});
+			if (!res.ok) {
+				if ((res.status === 401 || res.status === 403) && url !== lastUrl(spec)) continue;
+				return undefined;
+			}
+			const windows = spec.parse(await res.json(), url);
+			if (windows) {
+				return { source: spec.providers[0], ...windows, capturedAt: Date.now() };
+			}
+			return undefined;
+		} catch (err) {
+			if (err instanceof AuthRejectedError && url !== lastUrl(spec)) continue;
+			return undefined; // 网络请求尽力而为
 		}
-	} catch { /* 网络请求尽力而为 */ }
+	}
 	return undefined;
 }
 
 async function pollBalanceProvider(spec: BalanceProviderSpec): Promise<BalanceInfo | undefined> {
 	const key = resolveKey(spec);
 	if (!key) return undefined;
-	try {
-		const res = await fetch(spec.url, {
-			headers: spec.headers(key),
-			signal: AbortSignal.timeout(10_000),
-		});
-		if (!res.ok) return undefined;
-		return spec.parse(await res.json());
-	} catch { /* 网络请求尽力而为 */ }
+	for (const url of [spec.url, ...(spec.fallbackUrls ?? [])]) {
+		try {
+			const res = await fetch(url, {
+				headers: spec.headers(key),
+				signal: AbortSignal.timeout(10_000),
+			});
+			if (!res.ok) {
+				if ((res.status === 401 || res.status === 403) && url !== lastUrl(spec)) continue;
+				return undefined;
+			}
+			return spec.parse(await res.json(), url);
+		} catch (err) {
+			if (err instanceof AuthRejectedError && url !== lastUrl(spec)) continue;
+			return undefined; // 网络请求尽力而为
+		}
+	}
 	return undefined;
 }
 
@@ -413,7 +620,8 @@ export class QuotaService {
 				this.balancePollInFlight = true;
 				pollBalanceProvider(balSpec).then((info) => {
 					if (info && this.provider && findBalanceProvider(this.provider)) {
-						this.balanceInfo = info;
+						// provider 归一化为当前 pi provider id，避免多 id spec 永远判旧导致连续轮询
+						this.balanceInfo = { ...info, provider: this.provider };
 						this.notify();
 					}
 				}).finally(() => { this.balancePollInFlight = false; });

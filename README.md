@@ -227,6 +227,8 @@ AGENTS.md · skills x5 · ext.tools x2 · ✓ Grep ×10 · ◐ Edit (12s) · ◐
 - **Claude 订阅（OAuth）**：解析 `anthropic-ratelimit-unified-5h-*` / `-7d-*` 响应头
 - **Codex（ChatGPT OAuth）**：解析 `x-codex-primary-*`（主窗口）/ `x-codex-secondary-*`（周窗口）响应头，窗口时长由服务端返回，自动适配
 - **GLM Coding Plan（智谱，zai-coding-cn）**：响应头不含配额，HUD 每 5 分钟轮询 `open.bigmodel.cn/api/monitor/usage/quota/limit`（从环境变量 `ZAI_CODING_CN_API_KEY` 或 `~/.pi/agent/auth.json` 读取 key）
+- **GLM Coding Plan 国际版（zai / zai-coding-plan）**：同构接口，轮询 `api.z.ai`（Authorization 直接携带 key，不带 Bearer）
+- **opencode Zen 订阅（opencode / opencode-go）**：轮询 `opencode.ai/zen/go/v1/usage`，含 5h / 7d / 30d 三个窗口（30d 窗口由 `plan30d` 元素显示）
 - **MiniMax Coding Plan（minimax / minimax-cn）**：同样无响应头配额，HUD 每 5 分钟轮询 `api.minimaxi.com/v1/api/openplatform/coding_plan/remains`（key 来自 `MINIMAX_API_KEY` 或 `auth.json`）
 - **Kimi Coding Plan（kimi）**：同样无响应头配额，HUD 每 5 分钟轮询 `api.kimi.com/coding/v1/usages`（key 依次从 `KIMI_CODE_API_KEY`/`KIMI_API_KEY`、`auth.json`、或 `~/.pi/agent/models.json` 的 `providers.kimi.apiKey` 读取）
 - 颜色随用量变化：≤70% 绿 / >70% 黄 / >90% 红；`↻` 后为重置倒计时
@@ -241,6 +243,12 @@ AGENTS.md · skills x5 · ext.tools x2 · ✓ Grep ×10 · ◐ Edit (12s) · ◐
 ```
 
 - **DeepSeek**：轮询 `api.deepseek.com/user/balance`（key 依次从 `DEEPSEEK_API_KEY`、`auth.json`、`models.json` 的 `providers.deepseek.apiKey` 读取）
+- **StepFun**：轮询 `api.stepfun.com/v1/accounts`（人民币；`STEPFUN_API_KEY` / `auth.json` / `models.json`，支持 `"apiKey": "$STEPFUN_API_KEY"` 这类环境变量引用）
+- **Kimi 开放平台（moonshotai-cn / moonshot / moonshotai）**：轮询 `/v1/users/me/balance`，.cn 站人民币、.ai 站美元；主站 401/业务层拒绝时自动换另一站
+- **SiliconFlow（siliconflow / siliconflow-cn）**：轮询 `/v1/user/info`，.cn 人民币、.com 美元，同样支持站点回退
+- **OpenRouter（openrouter）**：轮询 `openrouter.ai/api/v1/credits` 计算剩余 Credits（需 Management Key，普通 Key 返回 403 时不显示）
+- **Skywork（skywork）**：轮询 `api.skyworkmodel.ai/api/v1/balance`（币种由响应携带）
+- **Novita（novita）**：轮询 `api.novita.ai/openapi/v1/billing/balance/detail`（接口单位 1/10000 USD，已换算）
 - 余额 ≤0 显示红色，<10 显示黄色，>10 绿色；超过 10 分钟未刷新变暗
 - 切换 provider 时自动清除旧余额数据
 

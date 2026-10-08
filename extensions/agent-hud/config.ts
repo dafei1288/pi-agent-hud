@@ -29,6 +29,7 @@ export type HudElement =
 	| "rateLimit"      // Line 2: ⚡ 85% (Anthropic/OpenAI rate limit)
 	| "plan5h"         // Line 2: ⏳5h 42% ↻2h15m (coding plan 5-hour window)
 	| "planWeek"       // Line 2: 📅wk 18% ↻3d (coding plan weekly window)
+	| "plan30d"        // Line 2: 🗓️30d 26% ↻26d (coding plan monthly window, e.g. opencode Zen)
 	| "toolStats"      // Line 2: ✓ Grep ×10
 	| "runningTools"   // Line 2: ◐ Edit (12s)
 	| "runningAgents"  // Line 2: ◐ agent (2m 15s)

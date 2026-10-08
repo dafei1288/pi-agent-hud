@@ -424,6 +424,18 @@ export function createHudFooter(
 						},
 					});
 				}
+				if (isEnabled(config, "plan30d") && planUsage?.monthly) {
+					const w = planUsage.monthly;
+					const label = w.windowMinutes ? formatWindowLabel(w.windowMinutes) : "wk";
+					line2Items.push({
+						key: "plan30d", defaultLine: 1, order: 9,
+						fixedCol: config.placement?.planWeek?.col,
+						render: () => {
+							const reset = w.resetAt ? formatResetCountdown(w.resetAt) : "";
+							return `${ctxColor(theme, w.usedPercent, `🗓️${label} ${Math.round(w.usedPercent)}%`)}${reset ? theme.fg("dim", ` ↻${reset}`) : ""}`;
+						},
+					});
+				}
 
 				if (isEnabled(config, "toolStats")) {
 					const sortedTools = Array.from(toolCounts.entries()).sort(([, a], [, b]) => b - a);
